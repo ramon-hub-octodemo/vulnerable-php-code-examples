@@ -1,0 +1,162 @@
+name: Copilot Security Analysis
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  models: read
+  actions: read
+
+jobs:
+  copilot-security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Analyze with Copilot and generate SARIF
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 << 'PYEOF'
+          import os
+          import json
+          import urllib.request
+          import urllib.error
+          import pathlib
+          import sys
+
+          GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+          REPO_ROOT = os.getcwd()
+          SARIF_OUTPUT = "copilot-security.sarif"
+          API_URL = "https://models.inference.ai.azure.com/chat/completions"
+          MODEL = "gpt-4o"
+          MAX_FILE_CHARS = 8000  # truncate large files to stay within token limits
+
+          def find_php_files(root):
+              return sorted(pathlib.Path(root).rglob("*.php"))
+
+          def call_copilot(file_content, file_path):
+              prompt = (
+                  "You are a security expert. Analyze the following PHP source code for security "
+                  "vulnerabilities (e.g. SQL injection, XSS, command injection, path traversal, "
+                  "insecure deserialization, sensitive data exposure, etc.).\n\n"
+                  "Return ONLY a JSON object with this exact structure (no markdown fences):\n"
+                  '{"vulnerabilities": [{"ruleId": "<CWE or rule id>", "ruleName": "<short name>", '
+                  '"ruleDescription": "<one-sentence description of the rule>", '
+                  '"message": "<specific finding>", "line": <1-based line number or 1 if unknown>, '
+                  '"severity": "<error|warning|note>"}]}\n\n'
+                  "If no vulnerabilities are found return: {\"vulnerabilities\": []}\n\n"
+                  f"File: {file_path}\n\n```php\n{file_content}\n```"
+              )
+              payload = json.dumps({
+                  "model": MODEL,
+                  "messages": [{"role": "user", "content": prompt}],
+                  "temperature": 0,
+                  "max_tokens": 2048,
+                  "response_format": {"type": "json_object"},
+              }).encode()
+              req = urllib.request.Request(
+                  API_URL,
+                  data=payload,
+                  headers={
+                      "Authorization": f"Bearer {GITHUB_TOKEN}",
+                      "Content-Type": "application/json",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=120) as resp:
+                      data = json.loads(resp.read())
+                  return json.loads(data["choices"][0]["message"]["content"])
+              except Exception as e:
+                  print(f"  [warn] API call failed for {file_path}: {e}", file=sys.stderr)
+                  return {"vulnerabilities": []}
+
+          def build_sarif(all_findings):
+              rules_map = {}
+              results = []
+
+              for file_rel, vulns in all_findings:
+                  for v in vulns:
+                      rule_id = v.get("ruleId", "UNKNOWN")
+                      rule_name = v.get("ruleName", rule_id)
+                      rule_desc = v.get("ruleDescription", rule_name)
+                      msg = v.get("message", "Potential security vulnerability detected.")
+                      line = max(1, int(v.get("line", 1)))
+                      severity_raw = v.get("severity", "warning").lower()
+                      level = severity_raw if severity_raw in ("error", "warning", "note") else "warning"
+
+                      if rule_id not in rules_map:
+                          rules_map[rule_id] = {
+                              "id": rule_id,
+                              "name": rule_name,
+                              "shortDescription": {"text": rule_desc},
+                              "fullDescription": {"text": rule_desc},
+                              "defaultConfiguration": {"level": level},
+                              "properties": {"tags": ["security"]},
+                          }
+
+                      results.append({
+                          "ruleId": rule_id,
+                          "message": {"text": msg},
+                          "level": level,
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {
+                                      "uri": file_rel,
+                                      "uriBaseId": "%SRCROOT%",
+                                  },
+                                  "region": {"startLine": line},
+                              }
+                          }],
+                      })
+
+              sarif = {
+                  "$schema": "https://docs.oasis-open.org/sarif/sarif/v2.1.0/csprd01/schemas/sarif-schema-2.1.0.json",
+                  "version": "2.1.0",
+                  "runs": [{
+                      "tool": {
+                          "driver": {
+                              "name": "Copilot Security Analysis",
+                              "version": "1.0.0",
+                              "informationUri": "https://github.com/features/copilot",
+                              "rules": list(rules_map.values()),
+                          }
+                      },
+                      "results": results,
+                  }],
+              }
+              return sarif
+
+          php_files = find_php_files(REPO_ROOT)
+          print(f"[+] Found {len(php_files)} PHP file(s)")
+
+          all_findings = []
+          for fp in php_files:
+              rel = str(fp.relative_to(REPO_ROOT))
+              print(f"  -> Analyzing {rel}")
+              content = fp.read_text(errors="replace")[:MAX_FILE_CHARS]
+              result = call_copilot(content, rel)
+              vulns = result.get("vulnerabilities", [])
+              if vulns:
+                  print(f"     Found {len(vulns)} issue(s)")
+              all_findings.append((rel, vulns))
+
+          sarif_doc = build_sarif(all_findings)
+          with open(SARIF_OUTPUT, "w") as f:
+              json.dump(sarif_doc, f, indent=2)
+          total = sum(len(v) for _, v in all_findings)
+          print(f"[+] SARIF written to {SARIF_OUTPUT} ({total} finding(s))")
+          PYEOF
+
+      - name: Upload SARIF to GitHub
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: copilot-security.sarif
+        if: always()
